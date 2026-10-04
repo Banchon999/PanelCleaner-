@@ -5,7 +5,8 @@ Guidance for Claude Code when working in this repository.
 ## What this is
 
 Panel Cleaner (`pcleaner`): a Python desktop/CLI tool that detects text in manga/comic pages,
-builds masks to cover it, optionally denoises and inpaints (LaMa), and can run OCR to extract text.
+builds masks to cover it, optionally denoises and inpaints (LaMa), and can run OCR to extract text
+and translate it through OpenRouter.
 GUI is PySide6 (Qt); CLI uses docopt. License GPL-3.0.
 
 ## Commands
@@ -15,7 +16,7 @@ All tooling is driven by the `Makefile` and uv dependency groups in `pyproject.t
 - Create CPU dev env: `make uv-sync-gui-cpu` (creates `.venv-gui-cpu`, Python 3.14 by default)
 - Run GUI: `make run-gui-cpu` or `python -m pcleaner.gui.launcher`
 - Run CLI: `python -m pcleaner.main <subcommand>` (see docstring at top of `pcleaner/main.py`)
-- Tests: `python -m pytest tests/`
+- Tests: `python -m pytest tests/` (set `QT_QPA_PLATFORM=offscreen` when headless)
 - Format: `make black-format` (black, line length 100; excludes `pcleaner/gui/ui_generated_files/` and `pcleaner/comic_text_detector/`)
 - Rebuild Qt UI code after editing `ui_files/*.ui`: `make compile-ui`
 - Translations: `make refresh-i18n` / `make compile-i18n`
@@ -50,9 +51,23 @@ Orchestration lives in two places that must be kept in sync when the pipeline ch
 - `supported_languages.py`: `LanguageCode` enum.
 - Output formatting (plain text / CSV) is in `ocr.py: format_output*`; parsing back in `parsers.py`.
 
+### Translation (`pcleaner/translation/`)
+- Optional, network-based step after OCR. Never required for cleaning.
+- `openrouter.py`: `OpenRouterClient` (requests-based, retries, JSON-mode fallback) and `resolve_api_key()`
+  (`OPENROUTER_API_KEY` env var wins over `Config.openrouter_api_key`).
+- `glossary.py`: `Glossary` loaded from CSV/JSON; only terms found on a page go into the prompt.
+- `translator.py`: one request per page, previous page lines as context; `translate_ocr_analytics()` returns
+  translations keyed by `OCRAnalytic.path`. Output is written by `ocr.format_output(..., translations=...)`
+  to `<name>_translated.<ext>`; the parsers ignore the translation column/`→ ` lines.
+- Settings live in the profile's `[Translator]` section (`TranslatorConfig`). Entry points: CLI
+  `pcleaner ocr --translate`, `pcleaner translate <file>`; GUI `processing.translate_ocr_output()`
+  (called from `perform_ocr` and after OCR review in `mainwindow_driver`).
+- Tests in `tests/test_translation.py` use a fake client, no network.
+
 ### Config
 - `config.py`: `Config` (app-wide, stored in user config dir) and `Profile` (per-preset settings:
-  `General`, `TextDetector`, `Preprocessor`, `Masker`, `Denoiser`, `Inpainter` sections).
+  `General`, `TextDetector`, `Preprocessor`, `Masker`, `Denoiser`, `Inpainter`, `Translator` sections).
+  Adding a section means wiring it into `Profile` (`bundle_config`, `load`, `fix`).
   Each section is an attrs class with `export_to_conf()` (writes an INI section with comments,
   `[CLI: ...]` / `[GUI: ...]` markers) and `import_from_conf()` (`try_to_load`).
 - Enums used as options (e.g. `OCREngine`) are `StrEnum`s; the GUI profile editor

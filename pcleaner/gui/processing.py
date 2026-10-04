@@ -22,6 +22,8 @@ import pcleaner.ocr.ocr as ocr
 import pcleaner.output_structures as ost
 import pcleaner.preprocessor as pp
 import pcleaner.structures as st
+import pcleaner.translation.openrouter as orc
+import pcleaner.translation.translator as trl
 import pcleaner.helpers as hp
 from pcleaner import model_downloader as md
 from pcleaner.config import LayeredExport
@@ -938,6 +940,17 @@ def perform_ocr(
             )
             gu.show_exception(None, tr("Save Failed"), tr("Failed to write detected text to file."))
 
+        if profile.translator.translation_enabled:
+            check_abortion()
+            text_out += "\n\n" + translate_ocr_output(
+                profile.translator,
+                config.openrouter_api_key,
+                ocr_analytics,
+                csv_output,
+                output_file,
+                abort_check=check_abortion,
+            )
+
     progress_callback.emit(
         ost.ProgressData(
             0,
@@ -1028,3 +1041,74 @@ def handle_merging_ocr_splits(
             segment_paths = [split_object.path for split_object in split_objects]
             split_from = split_objects[0].split_from
             st.merge_ocr_analytics(split_from, segment_paths, ocr_analytics)
+
+
+def translate_ocr_output(
+    translator_conf: cfg.TranslatorConfig,
+    configured_api_key: str | None,
+    ocr_analytics: list[st.OCRAnalytic],
+    csv_output: bool,
+    ocr_output_file: Path,
+    abort_check: Callable[[], None] | None = None,
+) -> str:
+    """
+    Translate the OCR results and write them next to the OCR output file.
+    This makes network requests, so it must not be run on the GUI thread.
+
+    :param translator_conf: The translator section of the profile.
+    :param configured_api_key: The OpenRouter API key from the config, if any.
+    :param ocr_analytics: The OCR results to translate.
+    :param csv_output: Whether to write a CSV file, otherwise plain text.
+    :param ocr_output_file: The path the OCR output was written to.
+    :param abort_check: [Optional] Called before each page, may raise to abort.
+    :return: A status message for the user.
+    """
+    output_file = trl.translated_output_path(ocr_output_file)
+    logger.info(
+        f"Translating OCR output to {translator_conf.translation_target_language} "
+        f"with {translator_conf.translation_model}."
+    )
+    try:
+        result = trl.translate_ocr_analytics(
+            ocr_analytics,
+            translator_conf,
+            orc.resolve_api_key(configured_api_key),
+            abort_check=abort_check,
+        )
+    except trl.TranslationError as e:
+        logger.error(f"Translation failed: {e}")
+        return tr("Translation failed: {error}").format(error=e)
+
+    text_out = ocr.format_output(
+        ocr_analytics,
+        csv_output,
+        (
+            tr("filename"),
+            tr("startx"),
+            tr("starty"),
+            tr("endx"),
+            tr("endy"),
+            tr("text"),
+            tr("translation"),
+        ),
+        translations=result.translations,
+    ).strip("\n \t")
+
+    message = text_out + "\n\n"
+    if result.failed_pages:
+        message += (
+            tr("Some bubbles could not be translated on these pages:")
+            + "\n"
+            + "\n".join(str(page) for page in result.failed_pages)
+            + "\n\n"
+        )
+    try:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file.write_text(text_out, encoding="utf-8")
+        message += tr("Saved translated text to {output_file}").format(output_file=output_file)
+    except OSError as e:
+        logger.error(f"Failed to write translated text to {output_file}: {e}")
+        message += tr("Failed to write translated text to {output_file}").format(
+            output_file=output_file
+        )
+    return message

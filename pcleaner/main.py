@@ -10,7 +10,9 @@ Usage:
         open <profile_name> | delete <profile_name> | set-default <profile_name> | repair <profile_name> |
         purge-missing) [--debug]
     pcleaner gui [<image_path> ...] [--debug]
-    pcleaner ocr [<image_path> ...] [--output-path=<output_path>] [--csv] [--profile=<profile>] [--cache-masks] [--debug]
+    pcleaner ocr [<image_path> ...] [--output-path=<output_path>] [--csv] [--translate] [--profile=<profile>]
+        [--cache-masks] [--debug]
+    pcleaner translate <ocr_file> [--output-path=<output_path>] [--profile=<profile>] [--debug]
     pcleaner config (show | open)
     pcleaner cache clear (all | models | cleaner)
     pcleaner load models [--cuda | --cpu | --both] [--force]
@@ -37,6 +39,9 @@ Subcommands:
     gui              Open the GUI. This is also automatically invoked if no command is given.
     ocr              Run only the OCR on the given image(s). Any number of images and directories can be given.
                      The output will be saved in a single text file for the whole batch.
+    translate        Translate an existing OCR output file (.txt or .csv) with OpenRouter, using the
+                     Translator settings of the profile, including the glossary.
+                     The translation is saved next to the file, e.g. detected_text_translated.csv.
     config           View or edit the config file. This stores setting independent of profiles.
         show         Show the current configuration. This doesn't show the current profile.
         open         Open the config file in the default editor (unless specified in the config).
@@ -81,6 +86,9 @@ Options:
     <profile_name>                  The saved name of the profile to open, delete, or set as default.
     --output-path=<output_path>     The path to save the OCR output file to.
     --csv                           Save the output of the OCR as a CSV file
+    --translate                     Also translate the OCR output with OpenRouter, even if translation
+                                    isn't enabled in the profile.
+    <ocr_file>                      An OCR output file (.txt or .csv) to translate.
     --cuda                          Load the torch models that support CUDA. They will only be used if supported.
     --cpu                           Load the open cv2 models that are optimized for CPU.
                                     They will only be used as a fallback, unless specified in the config.
@@ -94,6 +102,8 @@ Environment Variables:
     XDG_CONFIG_HOME                 Determines where the config file, profiles, and temporary window state is stored.
     XDG_CACHE_HOME                  Determines where the cache directory is located for temporary files, logs, and
                                     downloaded models.
+    OPENROUTER_API_KEY              The API key used for translating with OpenRouter.
+                                    Takes precedence over the key in the config file.
     GUARDED_CLEANER_CACHE           Set to an absolute path to override the default cache directory for temporary mask
                                     and output files. Models are still stored in the normal cache directory.
                                     This can be used to run multiple instances of Panel Cleaner with different cache
@@ -119,6 +129,11 @@ Examples:
                                     related to the cleaning process. You can save time skipping the first one
                                     or two steps, since the results are saved in the cache directory (unless
                                     you choose to delete them).
+
+    pcleaner ocr myfolder --csv --translate  Run OCR on all images in the folder and translate the text,
+                                    saving detected_text.csv and detected_text_translated.csv.
+
+    pcleaner translate detected_text.csv  Translate an OCR output file, e.g. after correcting it by hand.
 
 """
 
@@ -150,11 +165,14 @@ import pcleaner.masker as ma
 import pcleaner.memory_watcher as mw
 import pcleaner.model_downloader as md
 import pcleaner.ocr.ocr as ocr
+import pcleaner.ocr.parsers as op
 import pcleaner.ocr.supported_languages as osl
 import pcleaner.output_structures as ost
 import pcleaner.preprocessor as pp
 import pcleaner.profile_cli as pc
 import pcleaner.structures as st
+import pcleaner.translation.openrouter as orc
+import pcleaner.translation.translator as trl
 from pcleaner import __version__
 from pcleaner.config import LayeredExport
 
@@ -234,7 +252,13 @@ def main() -> None:
         except OSError as e:
             print(f"Error: {e}")
             sys.exit(1)
-        run_ocr(config, image_paths, args.output_path, args.cache_masks, args.csv)
+        translate = args["--translate"] or config.current_profile.translator.translation_enabled
+        run_ocr(config, image_paths, args.output_path, args.cache_masks, args.csv, translate)
+
+    elif args["translate"]:
+        config = cfg.load_config()
+        config.load_profile(args["--profile"])
+        run_translate(config, Path(args.ocr_file), args.output_path)
 
     elif args.cache and args.clear:
         config = cfg.load_config()
@@ -767,6 +791,7 @@ def run_ocr(
     output_path: str | None,
     cache_masks: bool,
     csv_output: bool,
+    translate: bool = False,
 ):
     """
     Run OCR on the given images. This is a byproduct of the pre-processing step,
@@ -777,6 +802,7 @@ def run_ocr(
     :param output_path: The path to output the results to.
     :param cache_masks: Whether to cache the masks.
     :param csv_output: Whether to output CSV data
+    :param translate: Whether to also translate the output.
     """
     if config.show_oom_warnings:
         mw.start_memory_watcher()
@@ -907,6 +933,97 @@ def run_ocr(
         print(f"Saved detected text to {path}")
     except OSError as e:
         print(f"Failed to write detected text to {path}")
+        logger.exception(e)
+
+    if translate:
+        translate_and_save(config, ocr_analytics, csv_output, trl.translated_output_path(path))
+
+
+def run_translate(config: cfg.Config, ocr_file: Path, output_path: str | None) -> None:
+    """
+    Translate an existing OCR output file.
+
+    :param config: The config to use.
+    :param ocr_file: The OCR output file (.txt or .csv).
+    :param output_path: [Optional] Where to save the translation.
+        By default, it is saved next to the OCR file.
+    """
+    ocr_analytics, errors = op.parse_ocr_data(ocr_file)
+    if errors:
+        print(f"Failed to parse {ocr_file}:")
+        for error in errors:
+            print(f"Line {error.line}: {error.error_code.name} {error.context.strip()}")
+        sys.exit(1)
+    if not ocr_analytics:
+        print(f"No text found in {ocr_file}.")
+        return
+
+    out_path = Path(output_path) if output_path else trl.translated_output_path(ocr_file)
+    translate_and_save(config, ocr_analytics, ocr_file.suffix == ".csv", out_path)
+
+
+def translate_and_save(
+    config: cfg.Config,
+    ocr_analytics: list[st.OCRAnalytic],
+    csv_output: bool,
+    output_path: Path,
+) -> None:
+    """
+    Translate the OCR results and write them to a file.
+
+    :param config: The config to use, the translator settings are taken from the current profile.
+    :param ocr_analytics: The OCR results to translate.
+    :param csv_output: Whether to write a CSV file, otherwise plain text.
+    :param output_path: The path to write the translation to.
+    """
+    translator_conf = config.current_profile.translator
+    api_key = orc.resolve_api_key(config.openrouter_api_key)
+    print(
+        f"\nTranslating to {translator_conf.translation_target_language} "
+        f"with {translator_conf.translation_model}..."
+    )
+
+    with tqdm(total=len(ocr_analytics)) as progress_bar:
+
+        def update_progress(done: int, _total: int) -> None:
+            progress_bar.n = done
+            progress_bar.refresh()
+
+        try:
+            result = trl.translate_ocr_analytics(
+                ocr_analytics, translator_conf, api_key, progress_callback=update_progress
+            )
+        except trl.TranslationError as e:
+            print(f"\nTranslation failed: {e}")
+            logger.debug(e)
+            sys.exit(1)
+
+    text_out = ocr.format_output(
+        ocr_analytics,
+        csv_output,
+        ("filename", "startx", "starty", "endx", "endy", "text", "translation"),
+        translations=result.translations,
+    ).strip()
+
+    print("\nTranslated Text:")
+    print(text_out)
+
+    if result.failed_pages:
+        print(
+            f"\nWarning: Some bubbles could not be translated on {len(result.failed_pages)} page(s):"
+        )
+        for page in result.failed_pages:
+            print(f"- {page}")
+
+    if output_path.exists():
+        if not cli.get_confirmation(f"File {output_path} already exists. Overwrite?"):
+            print("Aborting.")
+            return
+    try:
+        output_path.write_text(text_out, encoding="utf-8")
+        print(f"Saved translated text to {output_path}")
+    except OSError as e:
+        print(f"Failed to write translated text to {output_path}")
         logger.exception(e)
 
 

@@ -6,6 +6,9 @@ from collections import defaultdict
 
 import pcleaner.structures as st
 
+# Prefix for translation lines in the plain text output. These lines are skipped when parsing.
+TRANSLATION_MARKER = "→ "
+
 
 class ParseErrorCode(Enum):
     OS_ERROR = auto()
@@ -84,6 +87,9 @@ def parse_plain_text(path: Path) -> tuple[list[st.OCRAnalytic], list[ParseError]
             if not stripped_line:
                 expecting_file_path = True
                 continue
+            elif stripped_line.startswith(TRANSLATION_MARKER.strip()):
+                # Translations aren't part of the OCR data.
+                continue
             else:
                 text = stripped_line
                 box = st.Box(-1, -1, -1, -1)
@@ -115,6 +121,8 @@ def parse_csv(path: Path) -> tuple[list[st.OCRAnalytic], list[ParseError]]:
     img1.jpg,423,73,711,336,"something else, perhaps"
     img2.jpg,534,275,592,414,or nothing at all
 
+    A 7th translation column is allowed, but ignored.
+
     :param path: The path to the supposed csv file.
     :return: A list of analytics and a list of errors, one of which will be empty.
     """
@@ -128,7 +136,7 @@ def parse_csv(path: Path) -> tuple[list[st.OCRAnalytic], list[ParseError]]:
         # The header must not contain any digits.
         # If it does, then someone likely removed the header and now has box coordinates
         # in here, which would get ignored.
-        if len(header) != 6 or any(h.isdigit() for h in header):
+        if len(header) not in (6, 7) or any(h.isdigit() for h in header):
             parse_errors.append(
                 ParseError(
                     line=1,
@@ -139,8 +147,8 @@ def parse_csv(path: Path) -> tuple[list[st.OCRAnalytic], list[ParseError]]:
             return [], parse_errors
 
         for line_number, row in enumerate(csv_reader, start=2):
-            # Each row needs 6 columns.
-            if len(row) != 6:
+            # Each row needs as many columns as the header (6, or 7 with translations).
+            if len(row) != len(header):
                 parse_errors.append(
                     ParseError(
                         line=line_number,
@@ -150,7 +158,7 @@ def parse_csv(path: Path) -> tuple[list[st.OCRAnalytic], list[ParseError]]:
                 )
                 continue
 
-            filename, startx, starty, endx, endy, text = row
+            filename, startx, starty, endx, endy, text = row[:6]
 
             try:
                 startx = int(startx)

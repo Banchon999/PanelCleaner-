@@ -14,6 +14,7 @@ import pcleaner.helpers as hp
 from pcleaner.ocr.ocr_mangaocr import MangaOcr
 from pcleaner.ocr.ocr_tesseract import TesseractOcr
 import pcleaner.ocr.supported_languages as osl
+from pcleaner.ocr.parsers import TRANSLATION_MARKER
 
 
 class OCRModel(Protocol):
@@ -92,7 +93,8 @@ def build_ocr_engine_factory(
 def format_output(
     ocr_analytics: list[st.OCRAnalytic],
     csv_output: bool,
-    csv_column_names: tuple[str, str, str, str, str, str],
+    csv_column_names: tuple[str, ...],
+    translations: dict[Path, list[str]] | None = None,
 ) -> str:
     """
     Format the output of the OCR process.
@@ -100,7 +102,9 @@ def format_output(
     :param ocr_analytics: A list of the OCR analytics per image.
     :param csv_output: If True, output the data in CSV format, otherwise in plain text.
     :param csv_column_names: The (localized) names of the columns in the CSV output:
-        filename, startx, starty, endx, endy, text.
+        filename, startx, starty, endx, endy, text, and translation if translations are given.
+    :param translations: [Optional] Translations per analytic path, one per entry in removed_box_data.
+        When given, a translation column (CSV) or translation lines (plain text) are added.
     :return: The formatted output.
     """
     # Format of the analytics:
@@ -110,52 +114,66 @@ def format_output(
     #     itertools.chain.from_iterable(a.removed_box_data for a in ocr_analytics)
     # )
 
-    # Build tuples of the form (path, text) for the removed texts.
+    # Build tuples of the form (path, text, box, translation) for the removed texts.
     # This requires adding the path from the analytic to all the texts.
-    path_texts_coords: list[tuple[Path, str, st.Box]] = []
+    path_texts_coords: list[tuple[Path, str, st.Box, str | None]] = []
     for analytic in ocr_analytics:
-        for text, box in analytic.removed_box_data:
-            path_texts_coords.append((analytic.path, text, box))
+        page_translations = None if translations is None else translations.get(analytic.path, [])
+        for index, (text, box) in enumerate(analytic.removed_box_data):
+            translation = None
+            if page_translations is not None:
+                translation = page_translations[index] if index < len(page_translations) else ""
+            path_texts_coords.append((analytic.path, text, box, translation))
 
     if path_texts_coords:
-        paths, texts, boxes = zip(*path_texts_coords)
+        paths, texts, boxes, translated = zip(*path_texts_coords)
         paths = hp.trim_prefix_from_paths(paths)
-        path_texts_coords = list(zip(paths, texts, boxes))
-        # Sort by path.
+        path_texts_coords = list(zip(paths, texts, boxes, translated))
+        # Sort by path. The sort is stable, so the bubble order within a page is kept.
         path_texts_coords = natsorted(path_texts_coords, key=lambda x: x[0])
 
     if csv_output:
-        return format_output_csv(path_texts_coords, csv_column_names)
+        return format_output_csv(path_texts_coords, csv_column_names, translations is not None)
     return format_output_plain(path_texts_coords)
 
 
 def format_output_csv(
-    path_texts_coords: list[tuple[Path, str, st.Box]],
-    csv_column_names: tuple[str, str, str, str, str, str],
+    path_texts_coords: list[tuple[Path, str, st.Box, str | None]],
+    csv_column_names: tuple[str, ...],
+    with_translation: bool = False,
 ) -> str:
     buffer = StringIO()
     writer = csv.writer(buffer, quoting=csv.QUOTE_MINIMAL)
-    writer.writerow(csv_column_names)
+    if with_translation and len(csv_column_names) == 6:
+        csv_column_names = (*csv_column_names, "translation")
+    writer.writerow(csv_column_names[: 7 if with_translation else 6])
 
-    for path, bubble, box in path_texts_coords:
+    for path, bubble, box, translation in path_texts_coords:
         if "\n" in bubble:
             logger.warning(f"Detected newline in bubble: {path} {bubble} {box}")
             bubble = bubble.replace("\n", "\\n")
-        writer.writerow([path, *box.as_tuple, bubble])
+        row = [path, *box.as_tuple, bubble]
+        if with_translation:
+            row.append((translation or "").replace("\n", "\\n"))
+        writer.writerow(row)
 
     return buffer.getvalue()
 
 
-def format_output_plain(path_texts_coords: list[tuple[Path, str, st.Box]]) -> str:
+def format_output_plain(path_texts_coords: list[tuple[Path, str, st.Box, str | None]]) -> str:
     # Place the file path on it's own line, and only if it's different from the previous one.
+    # Translations are placed on the line after their bubble, prefixed with the marker.
     buffer = StringIO()
     current_path = ""
-    for path, bubble, _ in path_texts_coords:
+    for path, bubble, _, translation in path_texts_coords:
         if path != current_path:
             buffer.write(f"\n\n{path}: ")
             current_path = path
         buffer.write(f"\n{bubble}")
         if "\n" in bubble:
             logger.warning(f"Detected newline in bubble: {path} {bubble}")
+        if translation is not None:
+            translation = translation.replace("\n", " ")
+            buffer.write(f"\n{TRANSLATION_MARKER}{translation}")
 
     return buffer.getvalue()

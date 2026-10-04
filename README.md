@@ -35,6 +35,7 @@ The two bottom pages are what the program can output: either just the transparen
 > [Usage](#usage) \
 > [Profiles](#profiles) \
 > [OCR](#ocr) \
+> [Translation](#translation) \
 > [Examples](#examples-of-tricky-bubbles) \
 > [Acknowledgements](#acknowledgements) \
 > [License](#license) \
@@ -71,6 +72,8 @@ The two bottom pages are what the program can output: either just the transparen
 - Can also cut out the text from the rest of the image, e.g. to paste it over a colored rendition.
 
 - Can also run OCR on the pages and output the text to a file.
+
+- Optionally translates the OCR output with AI models through OpenRouter, with a glossary for consistent names and terms.
 
 - Review cleaning and OCR output, including editing the OCR output interactively before saving it.
 
@@ -307,6 +310,50 @@ For other distributions, refer to your package manager and the [official Tessera
 For detailed installation instructions and additional information, please refer to the [official Tesseract documentation](https://tesseract-ocr.github.io/tessdoc/).
 
 > Note: While Tesseract supports additional languages, Panel Cleaner will only utilize Tesseract for English and Japanese text recognition. English is installed by default. Follow the instructions here [Installing additional language packs](https://ocrmypdf.readthedocs.io/en/latest/languages.html) to install the Japanese language pack.  
+
+## Translation
+
+Panel Cleaner can translate the OCR output with an AI model through [OpenRouter](https://openrouter.ai),
+which gives access to many models (Gemini, DeepSeek, Claude, GPT, Qwen, ...) with a single API key.
+This is optional and the only feature that needs an internet connection.
+The translation is saved next to the OCR output, e.g. `detected_text.csv` → `detected_text_translated.csv`,
+with an extra `translation` column (CSV) or a `→ translation` line under each bubble (plain text).
+
+1. Create an API key at [openrouter.ai/keys](https://openrouter.ai/keys).
+2. Set the key in the GUI under *Settings > OpenRouter API Key*, in the config file
+   (`pcleaner config open`, option `openrouter_api_key`), or with the `OPENROUTER_API_KEY` environment variable.
+3. Configure the *Translator* section of your profile: enable it, pick the model and the target language.
+
+```bash
+# Run OCR and translate in one go.
+pcleaner ocr myfolder --csv --translate
+
+# Translate an existing OCR file, e.g. after correcting the OCR text in the review window.
+pcleaner translate detected_text.csv
+```
+
+In the GUI, enabling translation in the profile translates the OCR output automatically when it is saved,
+including after reviewing and editing it.
+
+Each page is sent as one request, so the model sees all bubbles of the page together,
+along with the last few translated bubbles of the previous page for consistency.
+
+### Glossary
+
+To keep names and terms consistent across chapters, point `glossary_path` in the Translator section to a
+CSV or JSON file. Only the terms that appear on a page are sent to the model.
+
+```csv
+source,target,note
+ルフィ,Luffy,main character
+ゴムゴムの,Gum-Gum,attack prefix
+```
+
+or as JSON:
+
+```json
+{"ルフィ": "Luffy", "ゴムゴムの": "Gum-Gum"}
+```
 
 ## Examples of Tricky Bubbles
 

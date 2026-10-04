@@ -403,6 +403,12 @@ class MainWindow(Qw.QMainWindow, Ui_MainWindow):
         # Handle the file manager extension.
         self.action_file_manager_extension.triggered.connect(self.open_file_manager_extension)
 
+        # The OpenRouter API key is app-wide, so it isn't stored in the profiles.
+        self.action_openrouter_api_key = Qg.QAction(self.tr("OpenRouter API Key..."), self)
+        self.action_openrouter_api_key.setIcon(Qg.QIcon.fromTheme("dialog-password"))
+        self.action_openrouter_api_key.triggered.connect(self.set_openrouter_api_key)
+        self.menu_settings.addAction(self.action_openrouter_api_key)
+
     def set_up_statusbar(self) -> None:
         """
         Add a label to show the current char total and time estimate.
@@ -1968,7 +1974,73 @@ class MainWindow(Qw.QMainWindow, Ui_MainWindow):
 
         self.textEdit_analytics.append(text_out + "\n\n")
 
+        if output_file is not None and self.config.current_profile.translator.translation_enabled:
+            self.start_ocr_translation(
+                list(ocr_analytics), self.ocr_review_options.csv_output, output_file
+            )
+
         self.ocr_review_options = None
+
+    def start_ocr_translation(
+        self, ocr_analytics: list[st.OCRAnalytic], csv_output: bool, ocr_output_file: Path
+    ) -> None:
+        """
+        Translate the reviewed OCR results in a worker thread, since this makes network requests.
+
+        :param ocr_analytics: The OCR results to translate.
+        :param csv_output: Whether to write a CSV file, otherwise plain text.
+        :param ocr_output_file: The path the OCR output was written to.
+        """
+        translator_conf = deepcopy(self.config.current_profile.translator)
+        self.textEdit_analytics.append(
+            self.tr("Translating to {language} with {model}...").format(
+                language=translator_conf.translation_target_language,
+                model=translator_conf.translation_model,
+            )
+            + "\n"
+        )
+        worker = wt.Worker(
+            prc.translate_ocr_output,
+            translator_conf,
+            self.config.openrouter_api_key,
+            ocr_analytics,
+            csv_output,
+            ocr_output_file,
+            no_progress_callback=True,
+        )
+        worker.signals.result.connect(
+            lambda message: self.textEdit_analytics.append(message + "\n\n")
+        )
+        worker.signals.error.connect(
+            lambda error: gu.show_exception(
+                self,
+                self.tr("Translation Failed"),
+                self.tr("Failed to translate the OCR output."),
+                error,
+            )
+        )
+        self.thread_queue.start(worker)
+
+    def set_openrouter_api_key(self) -> None:
+        """
+        Ask the user for their OpenRouter API key and save it to the config.
+        """
+        key, ok = Qw.QInputDialog.getText(
+            self,
+            self.tr("OpenRouter API Key"),
+            self.tr(
+                "Enter your OpenRouter API key, used to translate the OCR output.\n"
+                "You can create one at https://openrouter.ai/keys\n"
+                "Leave blank to remove the saved key."
+            ),
+            Qw.QLineEdit.Password,
+            self.config.openrouter_api_key or "",
+        )
+        if not ok:
+            return
+        self.config.openrouter_api_key = key.strip() or None
+        self.config.save()
+        logger.info(f"OpenRouter API key {'set' if self.config.openrouter_api_key else 'removed'}.")
 
     def generate_output(
         self,
