@@ -38,6 +38,7 @@ import pcleaner.gui.setup_greeter_driver as sgd
 import pcleaner.gui.state_saver as ss
 import pcleaner.gui.structures as gst
 import pcleaner.gui.supported_languages as sl
+import pcleaner.gui.translation_review_driver as trd
 import pcleaner.gui.post_action_config as pac
 import pcleaner.gui.post_action_runner as par
 import pcleaner.gui.worker_thread as wt
@@ -49,6 +50,8 @@ import pcleaner.ocr.supported_languages as osl
 import pcleaner.output_structures as ost
 import pcleaner.profile_cli as pc
 import pcleaner.structures as st
+import pcleaner.translation.openrouter as orc
+import pcleaner.translation.translator as trl
 from pcleaner import __display_name__, __version__
 from pcleaner import data
 from pcleaner.gui.file_table import Column
@@ -83,6 +86,7 @@ class MainWindow(Qw.QMainWindow, Ui_MainWindow):
 
     cleaning_review_options: None | gst.CleaningReviewOptions
     ocr_review_options: None | gst.OcrReviewOptions
+    translation_worker: wt.Worker | None  # The running OCR translation, if any.
     batch_metadata: None | gst.BatchMetadata
 
     profile_values_changed = Signal()
@@ -122,6 +126,7 @@ class MainWindow(Qw.QMainWindow, Ui_MainWindow):
         self.closed_post_action_banner = False
         self.cleaning_review_options = None
         self.ocr_review_options = None
+        self.translation_worker = None
         self.batch_metadata = None
         self.dead = False
 
@@ -379,16 +384,32 @@ class MainWindow(Qw.QMainWindow, Ui_MainWindow):
         self.pushButton_start.clicked.connect(self.start_processing)
         self.pushButton_abort.clicked.connect(self.abort_button_on_click)
         self.pushButton_edit_ocr.clicked.connect(self.edit_old_ocr_file)
+        # Add the translation review next to the OCR editing button.
+        self.pushButton_review_translation = Qw.QPushButton(
+            self.tr("Review Translation"), self.groupBox_process
+        )
+        self.pushButton_review_translation.setIcon(Qg.QIcon.fromTheme("document-edit"))
+        self.pushButton_review_translation.setToolTip(
+            self.tr("Review and edit an existing translated OCR output file.")
+        )
+        self.pushButton_review_translation.clicked.connect(self.review_translation_file)
+        self.verticalLayout_7.insertWidget(
+            self.verticalLayout_7.indexOf(self.pushButton_edit_ocr) + 1,
+            self.pushButton_review_translation,
+        )
         self.pushButton_browse_out_dir.clicked.connect(self.browse_output_dir)
         self.pushButton_browse_out_file.clicked.connect(self.browse_out_file)
         self.radioButton_cleaning.clicked.connect(
             partial(self.stackedWidget_output.setCurrentIndex, 0)
         )
         self.radioButton_cleaning.clicked.connect(self.pushButton_edit_ocr.hide)
+        self.radioButton_cleaning.clicked.connect(self.pushButton_review_translation.hide)
         self.radioButton_ocr.clicked.connect(partial(self.stackedWidget_output.setCurrentIndex, 1))
         self.radioButton_ocr.clicked.connect(self.pushButton_edit_ocr.show)
+        self.radioButton_ocr.clicked.connect(self.pushButton_review_translation.show)
         self.pushButton_abort.hide()
         self.pushButton_edit_ocr.hide()
+        self.pushButton_review_translation.hide()
         self.radioButton_ocr_text.clicked.connect(partial(self.handle_ocr_mode_change, csv=False))
         self.radioButton_ocr_csv.clicked.connect(partial(self.handle_ocr_mode_change, csv=True))
 
@@ -402,6 +423,12 @@ class MainWindow(Qw.QMainWindow, Ui_MainWindow):
 
         # Handle the file manager extension.
         self.action_file_manager_extension.triggered.connect(self.open_file_manager_extension)
+
+        # The OpenRouter API key is app-wide, so it isn't stored in the profiles.
+        self.action_openrouter_api_key = Qg.QAction(self.tr("OpenRouter API Key..."), self)
+        self.action_openrouter_api_key.setIcon(Qg.QIcon.fromTheme("dialog-password"))
+        self.action_openrouter_api_key.triggered.connect(self.set_openrouter_api_key)
+        self.menu_settings.addAction(self.action_openrouter_api_key)
 
     def set_up_statusbar(self) -> None:
         """
@@ -1968,7 +1995,231 @@ class MainWindow(Qw.QMainWindow, Ui_MainWindow):
 
         self.textEdit_analytics.append(text_out + "\n\n")
 
+        if output_file is not None and self.config.current_profile.translator.translation_enabled:
+            # The OCR was reviewed, so review the translation too.
+            self.start_ocr_translation(
+                list(ocr_analytics),
+                self.ocr_review_options.csv_output,
+                output_file,
+                review_images=list(self.ocr_review_options.image_files),
+            )
+
         self.ocr_review_options = None
+
+    def start_ocr_translation(
+        self,
+        ocr_analytics: list[st.OCRAnalytic],
+        csv_output: bool,
+        ocr_output_file: Path,
+        review_images: list[imf.ImageFile] | None = None,
+    ) -> None:
+        """
+        Translate the reviewed OCR results in a worker thread, since this makes network requests.
+
+        :param ocr_analytics: The OCR results to translate.
+        :param csv_output: Whether to write a CSV file, otherwise plain text.
+        :param ocr_output_file: The path the OCR output was written to.
+        :param review_images: [Optional] The images to show in the translation review afterwards.
+            If None, the translation isn't reviewed.
+        """
+        translator_conf = deepcopy(self.config.current_profile.translator)
+        self.textEdit_analytics.append(
+            self.tr("Translating to {language} with {model}...").format(
+                language=translator_conf.translation_target_language,
+                model=translator_conf.translation_model,
+            )
+            + "\n"
+        )
+        worker = wt.Worker(
+            prc.translate_ocr_output,
+            translator_conf,
+            self.config.openrouter_api_key,
+            ocr_analytics,
+            csv_output,
+            ocr_output_file,
+            no_progress_callback=True,
+        )
+        worker.signals.result.connect(
+            partial(
+                self.ocr_translation_result,
+                ocr_analytics=ocr_analytics,
+                csv_output=csv_output,
+                output_file=trl.translated_output_path(ocr_output_file),
+                review_images=review_images,
+                translator_conf=translator_conf,
+            )
+        )
+        worker.signals.error.connect(
+            lambda error: gu.show_exception(
+                self,
+                self.tr("Translation Failed"),
+                self.tr("Failed to translate the OCR output."),
+                error,
+            )
+        )
+        # Keep a reference until it's done, so the signals aren't garbage collected.
+        self.translation_worker = worker
+        worker.signals.finished.connect(lambda _: setattr(self, "translation_worker", None))
+        self.thread_queue.start(worker)
+
+    def ocr_translation_result(
+        self,
+        result: tuple[str, dict[Path, list[str]] | None],
+        ocr_analytics: list[st.OCRAnalytic],
+        csv_output: bool,
+        output_file: Path,
+        review_images: list[imf.ImageFile] | None,
+        translator_conf: cfg.TranslatorConfig,
+    ) -> None:
+        message, translations = result
+        self.textEdit_analytics.append(message + "\n\n")
+        if translations is None:
+            gu.show_warning(self, self.tr("Translation Failed"), message)
+            return
+        if review_images:
+            self.open_translation_review(
+                review_images, ocr_analytics, translations, output_file, csv_output, translator_conf
+            )
+
+    def open_translation_review(
+        self,
+        images: list[imf.ImageFile],
+        ocr_analytics: list[st.OCRAnalytic],
+        translations: dict[Path, list[str]],
+        output_file: Path,
+        csv_output: bool,
+        translator_conf: cfg.TranslatorConfig,
+    ) -> None:
+        """
+        Let the user review and edit the translations, then save them if anything changed.
+
+        :param images: The images the pages belong to.
+        :param ocr_analytics: The OCR results that were translated.
+        :param translations: The translations per analytic path.
+        :param output_file: The translated file to save the changes to.
+        :param csv_output: Whether the file is CSV, otherwise plain text.
+        :param translator_conf: The translator settings, used for translating again.
+        """
+        dialog = trd.TranslationReviewWindow(
+            self,
+            images,
+            ocr_analytics,
+            translations,
+            translator_conf,
+            orc.resolve_api_key(self.config.openrouter_api_key),
+        )
+        if not dialog.images:
+            gu.show_warning(
+                self,
+                self.tr("Nothing to Review"),
+                self.tr("None of the translated pages match the loaded images."),
+            )
+            dialog.deleteLater()
+            return
+        dialog.exec()
+
+        if dialog.has_changes() and (
+            gu.show_question(
+                self,
+                self.tr("Save Translation"),
+                self.tr("Would you like to save your changes to {path}?").format(path=output_file),
+                buttons=Qw.QMessageBox.Yes | Qw.QMessageBox.No,
+            )
+            == Qw.QMessageBox.Yes
+        ):
+            message = prc.write_translated_output(
+                ocr_analytics, dialog.get_final_translations(), csv_output, output_file
+            )
+            self.textEdit_analytics.append(message + "\n\n")
+        # Clean it up to prevent the close event from triggering on app termination.
+        dialog.deleteLater()
+
+    def review_translation_file(self) -> None:
+        """
+        Open an existing translated OCR output file for review.
+        """
+        if self.file_table.has_no_files():
+            gu.show_warning(
+                self,
+                self.tr("No Files"),
+                self.tr(
+                    "To review a translation, you must first load "
+                    "(one or more of) the images to which it corresponds."
+                ),
+            )
+            return
+        common_path = hp.common_path_parent([f.path for f in self.file_table.get_image_files()])
+
+        file_path = Qw.QFileDialog.getOpenFileName(
+            self,
+            self.tr("Open Translated OCR Output File"),
+            str(common_path),
+            self.tr("Translated OCR Output Files (*.txt *.csv)"),
+        )[0]
+        if not file_path:
+            return
+        file_path = Path(file_path)
+
+        results, translations, errors = op.parse_translation_data(file_path)
+        if errors:
+            message = Qw.QMessageBox(self)
+            message.setIcon(Qw.QMessageBox.Critical)
+            message.setWindowTitle(self.tr("Parse Error"))
+            message.setText(self.tr("Failed to parse the translated OCR output file."))
+            message.setDetailedText(gu.format_ocr_parse_errors(errors))
+            message.exec()
+            return
+
+        mapping, unmatched_images, unmatched_analytics = gu.match_image_files_to_ocr_analytics(
+            self.file_table.get_image_files(), results
+        )
+        review_dialog = imd.ImageMatchOverview(self, mapping, unmatched_images, unmatched_analytics)
+        if review_dialog.exec() != Qw.QDialog.Accepted:
+            return
+        final_mapping: dict[imf.ImageFile, st.OCRAnalytic] = review_dialog.export_final_mapping()
+        if not final_mapping:
+            return
+
+        # The overview replaces the analytics to expand their paths to the image paths,
+        # but keeps their bubble lists, so use those to find the translations again.
+        images = list(final_mapping.keys())
+        analytics = list(final_mapping.values())
+        matched_translations: dict[Path, list[str]] = {}
+        for analytic in analytics:
+            for parsed in results:
+                if parsed.removed_box_data is analytic.removed_box_data:
+                    matched_translations[analytic.path] = translations.get(parsed.path, [])
+                    break
+
+        self.open_translation_review(
+            images,
+            analytics,
+            matched_translations,
+            file_path,
+            file_path.suffix == ".csv",
+            deepcopy(self.config.current_profile.translator),
+        )
+
+    def set_openrouter_api_key(self) -> None:
+        """
+        Ask the user for their OpenRouter API key and save it to the config.
+        """
+        key, ok = Qw.QInputDialog.getText(
+            self,
+            self.tr("OpenRouter API Key"),
+            self.tr(
+                "Enter your OpenRouter API key, used to translate the OCR output.\n"
+                "You can create one at https://openrouter.ai/keys\n"
+                "Leave blank to remove the saved key."
+            ),
+            Qw.QLineEdit.Password,
+            self.config.openrouter_api_key or "",
+        )
+        if not ok:
+            return
+        self.config.openrouter_api_key = key.strip() or None
+        self.config.save()
+        logger.info(f"OpenRouter API key {'set' if self.config.openrouter_api_key else 'removed'}.")
 
     def generate_output(
         self,

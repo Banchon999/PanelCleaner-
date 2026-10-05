@@ -933,6 +933,102 @@ class InpainterConfig:
 
 
 @define
+class TranslatorConfig:
+    translation_enabled: bool = False
+    translation_model: str = "~google/gemini-flash-latest"
+    translation_source_language: str | None = None
+    translation_target_language: str = "English"
+    glossary_path: str | None = None
+    translation_instructions: LongString = ""
+    translation_temperature: float = 0.3
+    translation_context_lines: int = 10
+
+    def export_to_conf(
+        self, config_updater: cu.ConfigUpdater, add_after_section: str, gui_mode: bool = False
+    ) -> None:
+        """
+        Write the config to the config updater object.
+
+        :param config_updater: An existing config updater object.
+        :param add_after_section: The section to add the new section after.
+        :param gui_mode: Whether to format the config for the GUI.
+        """
+        config_str = f"""\
+        [Translator]
+
+        # Translate the OCR output with an AI model through OpenRouter (https://openrouter.ai).
+        # This requires an internet connection and an OpenRouter API key, which is set
+        # [CLI: in the config file (pcleaner config open)][GUI: under Settings > OpenRouter API Key]
+        # or with the OPENROUTER_API_KEY environment variable.
+        # The translation is saved next to the OCR output, e.g. detected_text_translated.csv.
+
+        # Whether to translate the OCR output.
+        translation_enabled = {self.translation_enabled}
+
+        # The OpenRouter model ID to use, e.g. ~google/gemini-flash-latest or deepseek/deepseek-v4-flash.
+        # See https://openrouter.ai/models for all models and their prices.
+        translation_model = {self.translation_model}
+
+        # The language of the original text, e.g. Japanese. Leave blank to detect it automatically.
+        translation_source_language = {none_to_empty(self.translation_source_language)}
+
+        # The language to translate into, written out in English, e.g. Thai, English, Spanish.
+        translation_target_language = {self.translation_target_language}
+
+        # Path to a glossary file (.csv or .json) with terms that must always be translated the same way,
+        # such as character names, places and attack names.[GUI: <br>]
+        # CSV format: one term per line as source,target,note (the note is optional).[GUI: <br>]
+        # JSON format: {{"source term": "translation", ...}}[GUI: <br>]
+        # Only the terms that appear on a page are sent to the model. Leave blank to not use a glossary.
+        glossary_path = {none_to_empty(self.glossary_path)}
+
+        # Extra instructions for the translator, such as the series name, the tone to use,
+        # or how to handle honorifics.
+        translation_instructions = {escape_all(self.translation_instructions)}
+
+        # How creative the model may be, from 0 to 2. Lower values give more literal translations.
+        translation_temperature = {self.translation_temperature}
+
+        # How many translated bubbles from the previous page to send along as context,
+        # to keep the story and wording consistent across pages. Set to 0 to disable.
+        translation_context_lines = {self.translation_context_lines}
+
+        """
+        translator_conf = cu.ConfigUpdater()
+        translator_conf.read_string(multi_left_strip(format_for_version(config_str, gui_mode)))
+        translator_section = translator_conf["Translator"]
+        config_updater[add_after_section].add_after.space(2).section(translator_section.detach())
+
+    def import_from_conf(self, config_updater: cu.ConfigUpdater) -> None:
+        """
+        Read the config from the config updater object.
+
+        :param config_updater: An existing config updater object.
+        """
+        section = "Translator"
+        if not config_updater.has_section(section):
+            logger.info(f"No {section} section found in the profile, using defaults.")
+            return
+
+        try_to_load(self, config_updater, section, bool, "translation_enabled")
+        try_to_load(self, config_updater, section, str, "translation_model")
+        try_to_load(self, config_updater, section, str | None, "translation_source_language")
+        try_to_load(self, config_updater, section, str, "translation_target_language")
+        try_to_load(self, config_updater, section, str | None, "glossary_path")
+        try_to_load(self, config_updater, section, LongString, "translation_instructions")
+        try_to_load(self, config_updater, section, float, "translation_temperature")
+        try_to_load(self, config_updater, section, int, "translation_context_lines")
+
+    def fix(self) -> None:
+        self.translation_model = self.translation_model.strip()
+        if not self.translation_target_language.strip():
+            self.translation_target_language = "English"
+        self.translation_temperature = min(max(self.translation_temperature, 0), 2)
+        if self.translation_context_lines < 0:
+            self.translation_context_lines = 0
+
+
+@define
 class Profile:
     """
     A profile is a collection of settings that can be saved and loaded from disk.
@@ -944,6 +1040,7 @@ class Profile:
     masker: MaskerConfig = field(factory=MaskerConfig)
     denoiser: DenoiserConfig = field(factory=DenoiserConfig)
     inpainter: InpainterConfig = field(factory=InpainterConfig)
+    translator: TranslatorConfig = field(factory=TranslatorConfig)
 
     def bundle_config(self, gui_mode: bool = False) -> cu.ConfigUpdater:
         """
@@ -959,6 +1056,7 @@ class Profile:
         self.masker.export_to_conf(config_updater, "Preprocessor", gui_mode=gui_mode)
         self.denoiser.export_to_conf(config_updater, "Masker", gui_mode=gui_mode)
         self.inpainter.export_to_conf(config_updater, "Denoiser", gui_mode=gui_mode)
+        self.translator.export_to_conf(config_updater, "Inpainter", gui_mode=gui_mode)
         return config_updater
 
     def hash_current_values(self) -> int:
@@ -1027,6 +1125,7 @@ class Profile:
             profile.masker.import_from_conf(config)
             profile.denoiser.import_from_conf(config)
             profile.inpainter.import_from_conf(config)
+            profile.translator.import_from_conf(config)
             profile.fix()
         except Exception:
             logger.exception(f"Failed to load profile from {path}")
@@ -1061,6 +1160,7 @@ class Profile:
         self.masker.fix()
         self.denoiser.fix()
         self.inpainter.fix()
+        self.translator.fix()
 
 
 @define
@@ -1089,6 +1189,7 @@ class Config:
     pa_cancel_on_error: bool = True
     pa_last_action: str | None = None
     pa_custom_commands: dict[str, str] = field(factory=dict)
+    openrouter_api_key: str | None = None
 
     @staticmethod
     def reserved_profile_names() -> list[str]:
@@ -1154,6 +1255,10 @@ class Config:
         print("PA Shutdown Command:", self.pa_shutdown_command)
         print("PA Cancel on Error:", self.pa_cancel_on_error)
         print("PA Last Action:", self.pa_last_action)
+        print(
+            "OpenRouter API Key:",
+            f"set (...{self.openrouter_api_key[-4:]})" if self.openrouter_api_key else "Not set",
+        )
         print("PA Custom Commands:")
         for name, command in self.pa_custom_commands.items():
             print(f"- {name}: {command}")
@@ -1287,6 +1392,12 @@ class Config:
         # Cancel the custom action if an error occurs.
         pa_cancel_on_error = {self.pa_cancel_on_error}
         
+        [OpenRouter]
+        # API key for translating OCR output through https://openrouter.ai
+        # The OPENROUTER_API_KEY environment variable takes precedence over this.
+        openrouter_api_key = {none_to_empty(self.openrouter_api_key)}
+        
+        
         # Commands are stored in Base32, to prevent issues with special characters.
         # This is a GUI-only feature, so readability isn't a concern.
         [Custom Commands]
@@ -1338,6 +1449,8 @@ class Config:
         try_to_load(config, conf_updater, section, str | None, "pa_shutdown_command")
         try_to_load(config, conf_updater, section, bool, "pa_cancel_on_error")
         try_to_load(config, conf_updater, section, str | None, "pa_last_action")
+        if conf_updater.has_section("OpenRouter"):
+            try_to_load(config, conf_updater, "OpenRouter", str | None, "openrouter_api_key")
         if "Custom Commands" in conf_updater:
             config.pa_custom_commands = {
                 from_base32_modified(k): from_base32_modified(v.value)
