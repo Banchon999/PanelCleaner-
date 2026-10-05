@@ -35,6 +35,13 @@ class ParseError:
 
 
 def parse_plain_text(path: Path) -> tuple[list[st.OCRAnalytic], list[ParseError]]:
+    analytics, _, errors = _parse_plain_text(path)
+    return analytics, errors
+
+
+def _parse_plain_text(
+    path: Path,
+) -> tuple[list[st.OCRAnalytic], dict[Path, list[str]], list[ParseError]]:
     """
     Try to load the file, assuming it's a plain text file.
     If it isn't, raise a FileNotPlain Error, along with relevant
@@ -49,11 +56,15 @@ def parse_plain_text(path: Path) -> tuple[list[st.OCRAnalytic], list[ParseError]
     anotherfile.jpg:
     This is some text.
 
+    Translation lines, starting with the translation marker, belong to the bubble above them.
+
     :param path: The path to the supposed csv file.
-    :return: A list of analytics and a list of errors, one of which will be empty.
+    :return: A list of analytics, the translations per path and a list of errors.
+        Either the analytics or the errors will be empty.
     """
 
     analytics_data: dict[Path, list[tuple[str, st.Box]]] = defaultdict(list)
+    translation_data: dict[Path, list[str]] = defaultdict(list)
     parse_errors: list[ParseError] = []
 
     with path.open("r", encoding="utf-8") as file:
@@ -88,15 +99,19 @@ def parse_plain_text(path: Path) -> tuple[list[st.OCRAnalytic], list[ParseError]
                 expecting_file_path = True
                 continue
             elif stripped_line.startswith(TRANSLATION_MARKER.strip()):
-                # Translations aren't part of the OCR data.
+                # Translations aren't part of the OCR data, attach them to the bubble above.
+                if analytics_data[current_path]:
+                    translation = stripped_line[len(TRANSLATION_MARKER.strip()) :].strip()
+                    translation_data[current_path][-1] = translation
                 continue
             else:
                 text = stripped_line
                 box = st.Box(-1, -1, -1, -1)
                 analytics_data[current_path].append((text, box))
+                translation_data[current_path].append("")
 
     if parse_errors:
-        return [], parse_errors
+        return [], {}, parse_errors
 
     # Pack the analytics data by file path.
     analytics_list = []
@@ -105,10 +120,15 @@ def parse_plain_text(path: Path) -> tuple[list[st.OCRAnalytic], list[ParseError]
             continue
         analytics_list.append(st.OCRAnalytic(file_path, len(box_data), [], [], box_data))
 
-    return analytics_list, []
+    return analytics_list, dict(translation_data), []
 
 
 def parse_csv(path: Path) -> tuple[list[st.OCRAnalytic], list[ParseError]]:
+    analytics, _, errors = _parse_csv(path)
+    return analytics, errors
+
+
+def _parse_csv(path: Path) -> tuple[list[st.OCRAnalytic], dict[Path, list[str]], list[ParseError]]:
     """
     Try to load the file, assuming it's a csv file.
     If it isn't, raise a FileNotCSV Error, along with relevant
@@ -121,12 +141,14 @@ def parse_csv(path: Path) -> tuple[list[st.OCRAnalytic], list[ParseError]]:
     img1.jpg,423,73,711,336,"something else, perhaps"
     img2.jpg,534,275,592,414,or nothing at all
 
-    A 7th translation column is allowed, but ignored.
+    A 7th translation column is allowed.
 
     :param path: The path to the supposed csv file.
-    :return: A list of analytics and a list of errors, one of which will be empty.
+    :return: A list of analytics, the translations per path and a list of errors.
+        Either the analytics or the errors will be empty.
     """
     analytics_data: dict[Path, list[tuple[str, st.Box]]] = defaultdict(list)
+    translation_data: dict[Path, list[str]] = defaultdict(list)
     parse_errors: list[ParseError] = []
 
     with path.open("r", encoding="utf-8") as file:
@@ -144,7 +166,7 @@ def parse_csv(path: Path) -> tuple[list[st.OCRAnalytic], list[ParseError]]:
                     context=",".join(header),
                 )
             )
-            return [], parse_errors
+            return [], {}, parse_errors
 
         for line_number, row in enumerate(csv_reader, start=2):
             # Each row needs as many columns as the header (6, or 7 with translations).
@@ -217,16 +239,18 @@ def parse_csv(path: Path) -> tuple[list[st.OCRAnalytic], list[ParseError]]:
             box = st.Box(startx, starty, endx, endy)
 
             analytics_data[file_path].append((text, box))
+            translation = row[6].replace("\\n", "\n") if len(row) > 6 else ""
+            translation_data[file_path].append(translation)
 
     if parse_errors:
-        return [], parse_errors
+        return [], {}, parse_errors
 
     # Pack the analytics data by file path.
     analytics_list = []
     for file_path, box_data in analytics_data.items():
         analytics_list.append(st.OCRAnalytic(file_path, len(box_data), [], [], box_data))
 
-    return analytics_list, []
+    return analytics_list, dict(translation_data), []
 
 
 def parse_ocr_data(path: Path) -> tuple[list[st.OCRAnalytic], list[ParseError]]:
@@ -248,3 +272,31 @@ def parse_ocr_data(path: Path) -> tuple[list[st.OCRAnalytic], list[ParseError]]:
         return [], [ParseError(line=-1, error_code=ParseErrorCode.OS_ERROR, context=str(e))]
     except Exception as e:
         return [], [ParseError(line=-1, error_code=ParseErrorCode.OTHER_ERROR, context=str(e))]
+
+
+def parse_translation_data(
+    path: Path,
+) -> tuple[list[st.OCRAnalytic], dict[Path, list[str]], list[ParseError]]:
+    """
+    Parse a translated OCR output file, keeping the translations.
+    Bubbles without a translation get an empty string.
+
+    :param path: The path to the translated OCR data file (.csv or .txt).
+    :return: A list of analytics, the translations per analytic path (one per bubble),
+        and a list of errors.
+    """
+    try:
+        if path.suffix == ".csv":
+            return _parse_csv(path)
+        elif path.suffix == ".txt":
+            return _parse_plain_text(path)
+        else:
+            return (
+                [],
+                {},
+                [ParseError(line=-1, error_code=ParseErrorCode.INVALID_FORMAT, context="")],
+            )
+    except OSError as e:
+        return [], {}, [ParseError(line=-1, error_code=ParseErrorCode.OS_ERROR, context=str(e))]
+    except Exception as e:
+        return [], {}, [ParseError(line=-1, error_code=ParseErrorCode.OTHER_ERROR, context=str(e))]

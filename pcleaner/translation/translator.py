@@ -210,6 +210,66 @@ def translate_page(
     return translations, len(parsed) == len(send_texts)
 
 
+def create_client(translator_conf: cfg.TranslatorConfig, api_key: str | None) -> OpenRouterClient:
+    """
+    Create the OpenRouter client for the configured model.
+
+    :param translator_conf: The translator section of the profile.
+    :param api_key: The OpenRouter API key.
+    :return: The client.
+    :raises TranslationError: If the API key or model is missing.
+    """
+    try:
+        return OpenRouterClient(
+            api_key,
+            translator_conf.translation_model,
+            translator_conf.translation_temperature,
+        )
+    except OpenRouterError as e:
+        raise TranslationError(str(e)) from e
+
+
+def retranslate_page(
+    translator_conf: cfg.TranslatorConfig,
+    api_key: str | None,
+    page_name: str,
+    texts: list[str],
+    previous_context: list[tuple[str, str]],
+) -> list[str]:
+    """
+    Translate a single page again, e.g. from the review window.
+    The glossary is reloaded, so terms added in the meantime are used.
+
+    :param translator_conf: The translator section of the profile.
+    :param api_key: The OpenRouter API key.
+    :param page_name: The page name, given to the model for context.
+    :param texts: The bubble texts of the page.
+    :param previous_context: (source, translation) pairs from the previous page.
+    :return: The translations in the same order as the texts.
+    :raises TranslationError: If the translation failed, or was incomplete.
+    """
+    glossary = load_glossary(translator_conf)
+    client = create_client(translator_conf, api_key)
+    try:
+        translations, complete = translate_page(
+            client,
+            build_system_prompt(translator_conf),
+            page_name,
+            texts,
+            glossary,
+            (
+                previous_context[-translator_conf.translation_context_lines :]
+                if translator_conf.translation_context_lines > 0
+                else []
+            ),
+        )
+    except OpenRouterError as e:
+        raise TranslationError(str(e)) from e
+    if not complete:
+        raise TranslationError("The model didn't return a translation for every bubble.")
+    return translations
+
+
 def translate_ocr_analytics(
     ocr_analytics: list[st.OCRAnalytic],
     translator_conf: cfg.TranslatorConfig,
@@ -230,14 +290,7 @@ def translate_ocr_analytics(
     :raises TranslationError: If the setup is invalid or the API rejects the request.
     """
     glossary = load_glossary(translator_conf)
-    try:
-        client = OpenRouterClient(
-            api_key,
-            translator_conf.translation_model,
-            translator_conf.translation_temperature,
-        )
-    except OpenRouterError as e:
-        raise TranslationError(str(e)) from e
+    client = create_client(translator_conf, api_key)
 
     system_prompt = build_system_prompt(translator_conf)
     translations: dict[Path, list[str]] = {}

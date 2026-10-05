@@ -335,6 +335,22 @@ pcleaner translate detected_text.csv
 In the GUI, enabling translation in the profile translates the OCR output automatically when it is saved,
 including after reviewing and editing it.
 
+### Reviewing Translations
+
+When *Review Output* is checked, the translation review window opens after translating.
+To review an existing translation, switch to the OCR output option and click *Review Translation*
+(load the images first). The window shows each page with numbered boxes next to a table of
+the original text and its translation:
+
+- Edit a translation by double-clicking it. Boxes are green when translated, blue when edited by you,
+  and red when the translation is missing.
+- *Retranslate Bubble* / *Retranslate Page* ask the model again, with the whole page as context.
+  Retranslating a page keeps the bubbles you edited.
+- *Add to Glossary* adds a term from the selected bubble to the profile's glossary file,
+  so it is translated the same way from then on, including in the retranslations.
+
+Your changes are saved back to the translated file when you close the window.
+
 Each page is sent as one request, so the model sees all bubbles of the page together,
 along with the last few translated bubbles of the previous page for consistency.
 

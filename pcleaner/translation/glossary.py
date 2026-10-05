@@ -144,3 +144,60 @@ class Glossary:
         """
         haystack = "\n".join(texts).casefold()
         return [entry for entry in self.entries if entry.source.casefold() in haystack]
+
+
+def add_glossary_entry(path: Path | str, entry: GlossaryEntry) -> None:
+    """
+    Add a term to a glossary file, replacing an existing entry with the same source term.
+    The file is created if it doesn't exist yet, as CSV unless it has a .json suffix.
+
+    :param path: The path to the glossary file.
+    :param entry: The term to add.
+    :raises GlossaryError: If the existing file can't be read or written.
+    """
+    path = Path(path).expanduser()
+    if not entry.source.strip() or not entry.target.strip():
+        raise GlossaryError("Both the source term and its translation are required.")
+    is_json = path.suffix.lower() == ".json"
+    entries: list[GlossaryEntry] = []
+    if path.is_file():
+        try:
+            content = path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as e:
+            raise GlossaryError(f"Failed to read glossary file {path}: {e}") from e
+        entries = Glossary._parse_json(content, path) if is_json else Glossary._parse_csv(content)
+
+    # Keep the user's order: replace the term in place, or append it at the end.
+    sources = [e.source for e in entries]
+    is_new_term = entry.source not in sources
+    if is_new_term:
+        entries.append(entry)
+    else:
+        entries[sources.index(entry.source)] = entry
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not is_json and is_new_term and path.is_file():
+            # Append a single row, so comments and formatting in the file are kept.
+            with path.open("r+", encoding="utf-8", newline="") as file:
+                content = file.read()
+                if content and not content.endswith(("\n", "\r")):
+                    file.write("\n")
+                csv.writer(file, lineterminator="\n").writerow(
+                    [entry.source, entry.target, entry.note]
+                )
+        elif is_json:
+            data = [
+                {"source": e.source, "target": e.target, **({"note": e.note} if e.note else {})}
+                for e in entries
+            ]
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        else:
+            with path.open("w", encoding="utf-8", newline="") as file:
+                writer = csv.writer(file, lineterminator="\n")
+                writer.writerow(["source", "target", "note"])
+                for e in entries:
+                    writer.writerow([e.source, e.target, e.note])
+    except OSError as e:
+        raise GlossaryError(f"Failed to write glossary file {path}: {e}") from e
+    logger.info(f"Added glossary entry {entry.source!r} -> {entry.target!r} to {path}")

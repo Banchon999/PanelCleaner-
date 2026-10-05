@@ -942,7 +942,7 @@ def perform_ocr(
 
         if profile.translator.translation_enabled:
             check_abortion()
-            text_out += "\n\n" + translate_ocr_output(
+            translation_message, _ = translate_ocr_output(
                 profile.translator,
                 config.openrouter_api_key,
                 ocr_analytics,
@@ -950,6 +950,7 @@ def perform_ocr(
                 output_file,
                 abort_check=check_abortion,
             )
+            text_out += "\n\n" + translation_message
 
     progress_callback.emit(
         ost.ProgressData(
@@ -1050,7 +1051,7 @@ def translate_ocr_output(
     csv_output: bool,
     ocr_output_file: Path,
     abort_check: Callable[[], None] | None = None,
-) -> str:
+) -> tuple[str, dict[Path, list[str]] | None]:
     """
     Translate the OCR results and write them next to the OCR output file.
     This makes network requests, so it must not be run on the GUI thread.
@@ -1061,7 +1062,7 @@ def translate_ocr_output(
     :param csv_output: Whether to write a CSV file, otherwise plain text.
     :param ocr_output_file: The path the OCR output was written to.
     :param abort_check: [Optional] Called before each page, may raise to abort.
-    :return: A status message for the user.
+    :return: A status message for the user, and the translations, or None if it failed.
     """
     output_file = trl.translated_output_path(ocr_output_file)
     logger.info(
@@ -1077,8 +1078,35 @@ def translate_ocr_output(
         )
     except trl.TranslationError as e:
         logger.error(f"Translation failed: {e}")
-        return tr("Translation failed: {error}").format(error=e)
+        return tr("Translation failed: {error}").format(error=e), None
 
+    message = ""
+    if result.failed_pages:
+        message += (
+            tr("Some bubbles could not be translated on these pages:")
+            + "\n"
+            + "\n".join(str(page) for page in result.failed_pages)
+            + "\n\n"
+        )
+    message += write_translated_output(ocr_analytics, result.translations, csv_output, output_file)
+    return message, result.translations
+
+
+def write_translated_output(
+    ocr_analytics: list[st.OCRAnalytic],
+    translations: dict[Path, list[str]],
+    csv_output: bool,
+    output_file: Path,
+) -> str:
+    """
+    Write the translated OCR output to a file.
+
+    :param ocr_analytics: The OCR results that were translated.
+    :param translations: The translations per analytic path, one per bubble.
+    :param csv_output: Whether to write a CSV file, otherwise plain text.
+    :param output_file: The path to write to.
+    :return: The written text and a status message for the user.
+    """
     text_out = ocr.format_output(
         ocr_analytics,
         csv_output,
@@ -1091,17 +1119,10 @@ def translate_ocr_output(
             tr("text"),
             tr("translation"),
         ),
-        translations=result.translations,
+        translations=translations,
     ).strip("\n \t")
 
     message = text_out + "\n\n"
-    if result.failed_pages:
-        message += (
-            tr("Some bubbles could not be translated on these pages:")
-            + "\n"
-            + "\n".join(str(page) for page in result.failed_pages)
-            + "\n\n"
-        )
     try:
         output_file.parent.mkdir(parents=True, exist_ok=True)
         output_file.write_text(text_out, encoding="utf-8")

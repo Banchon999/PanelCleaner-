@@ -9,6 +9,7 @@ import pcleaner.ocr.parsers as op
 import pcleaner.structures as st
 import pcleaner.translation.openrouter as orc
 import pcleaner.translation.translator as trl
+import pcleaner.translation.glossary as gl
 from pcleaner.translation.glossary import Glossary, GlossaryEntry, GlossaryError
 
 
@@ -273,3 +274,78 @@ def test_translator_fix_clamps_values():
     assert conf.translation_temperature == 2
     assert conf.translation_context_lines == 0
     assert conf.translation_target_language == "English"
+
+
+# ================================ Review support ================================
+
+
+def test_parse_translation_data_round_trip(tmp_path):
+    analytics = [make_analytic("/x/p1.jpg", ["a", "b"]), make_analytic("/x/p2.jpg", ["c"])]
+    translations = {Path("/x/p1.jpg"): ["A\nline", ""], Path("/x/p2.jpg"): ["C"]}
+    columns = ("filename", "startx", "starty", "endx", "endy", "text", "translation")
+
+    for csv_output, suffix in ((True, ".csv"), (False, ".txt")):
+        path = tmp_path / f"out{suffix}"
+        text = ocr.format_output(analytics, csv_output, columns, translations=translations)
+        path.write_text(text.strip(), encoding="utf-8")
+        parsed, parsed_translations, errors = op.parse_translation_data(path)
+        assert not errors
+        assert [a.path for a in parsed] == [Path("p1.jpg"), Path("p2.jpg")]
+        expected_first = "A\nline" if csv_output else "A line"
+        assert parsed_translations[Path("p1.jpg")] == [expected_first, ""]
+        assert parsed_translations[Path("p2.jpg")] == ["C"]
+
+
+def test_parse_translation_data_without_translations(tmp_path):
+    path = tmp_path / "plain.csv"
+    path.write_text("filename,startx,starty,endx,endy,text\np1.jpg,1,1,2,2,a\n", encoding="utf-8")
+    parsed, translations, errors = op.parse_translation_data(path)
+    assert not errors
+    assert translations == {Path("p1.jpg"): [""]}
+
+
+def test_add_glossary_entry_csv_keeps_comments_and_replaces(tmp_path):
+    path = tmp_path / "glossary.csv"
+    path.write_text("source,target,note\n# names\nゾロ,Zoro", encoding="utf-8")
+
+    gl.add_glossary_entry(path, GlossaryEntry("ルフィ", "Luffy", "captain"))
+    assert path.read_text(encoding="utf-8") == (
+        "source,target,note\n# names\nゾロ,Zoro\nルフィ,Luffy,captain\n"
+    )
+
+    gl.add_glossary_entry(path, GlossaryEntry("ゾロ", "Zolo"))
+    assert Glossary.load(path).find_matches(["ゾロ"]) == [GlossaryEntry("ゾロ", "Zolo")]
+    assert len(Glossary.load(path)) == 2
+
+
+def test_add_glossary_entry_json_and_new_file(tmp_path):
+    json_path = tmp_path / "g.json"
+    json_path.write_text(json.dumps({"ゾロ": "Zoro"}), encoding="utf-8")
+    gl.add_glossary_entry(json_path, GlossaryEntry("ルフィ", "Luffy"))
+    assert Glossary.load(json_path).entries == [
+        GlossaryEntry("ルフィ", "Luffy"),
+        GlossaryEntry("ゾロ", "Zoro"),
+    ]
+
+    new_path = tmp_path / "sub" / "new.csv"
+    gl.add_glossary_entry(new_path, GlossaryEntry("ナミ", "Nami"))
+    assert Glossary.load(new_path).entries == [GlossaryEntry("ナミ", "Nami")]
+
+    with pytest.raises(GlossaryError):
+        gl.add_glossary_entry(new_path, GlossaryEntry("ナミ", " "))
+
+
+def test_retranslate_page(monkeypatch):
+    client = FakeClient()
+    monkeypatch.setattr(trl, "OpenRouterClient", lambda *args, **kwargs: client)
+    conf = cfg.TranslatorConfig(translation_context_lines=1)
+
+    result = trl.retranslate_page(conf, "key", "p1.jpg", ["a", "b"], [("x", "X"), ("y", "Y")])
+    assert result == ["T:a", "T:b"]
+    payload = json.loads(client.requests[0][1]["content"])
+    assert payload["previous_page_context"] == [{"source": "y", "translation": "Y"}]
+
+    bad = FakeClient(['{"translations": []}'] * (trl.MAX_FORMAT_RETRIES + 1))
+    monkeypatch.setattr(trl, "OpenRouterClient", lambda *args, **kwargs: bad)
+    with pytest.raises(trl.TranslationError):
+        trl.retranslate_page(conf, "key", "p1.jpg", ["a"], [])

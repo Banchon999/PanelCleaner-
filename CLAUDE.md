@@ -62,6 +62,12 @@ Orchestration lives in two places that must be kept in sync when the pipeline ch
 - Settings live in the profile's `[Translator]` section (`TranslatorConfig`). Entry points: CLI
   `pcleaner ocr --translate`, `pcleaner translate <file>`; GUI `processing.translate_ocr_output()`
   (called from `perform_ocr` and after OCR review in `mainwindow_driver`).
+- Review UI: `gui/translation_review_driver.py` (`TranslationReviewWindow`, `ui_files/TranslationReview.ui`).
+  Opened after a reviewed OCR run, or via the "Review Translation" button with
+  `ocr.parsers.parse_translation_data()`. Pages are matched to images by path. Retranslation uses
+  `translator.retranslate_page()`; "Add to Glossary" uses `glossary.add_glossary_entry()`.
+- Keep a reference to running `wt.Worker`s you create (e.g. `self.current_worker`), otherwise their
+  signals can be garbage collected before the result arrives.
 - Tests in `tests/test_translation.py` use a fake client, no network.
 
 ### Config
